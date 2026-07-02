@@ -2,6 +2,33 @@ import pandas as pd
 
 
 class ColumnClassifier:
+    # ISO calendar-week format, e.g. 202653 = Jahr 2026, KW 53
+    _CW_MIN_YEAR, _CW_MAX_YEAR = 1900, 2100
+
+    @classmethod
+    def _parse_calendar_week(cls, s: pd.Series) -> pd.Series:
+        """Parse YYYYWW-style ISO calendar-week values (e.g. 202653) to the Monday of that week."""
+        text = s.astype(str).str.strip()
+        groups = text.str.extract(r"^(\d{4})(\d{2})$")
+        year = pd.to_numeric(groups[0], errors="coerce")
+        week = pd.to_numeric(groups[1], errors="coerce")
+        valid = year.between(cls._CW_MIN_YEAR, cls._CW_MAX_YEAR) & week.between(1, 53)
+
+        parsed = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+        if valid.any():
+            parsed.loc[valid] = pd.to_datetime(
+                text[valid] + "1", format="%G%V%u", errors="coerce"
+            )
+        return parsed
+
+    @classmethod
+    def parse_dates(cls, s: pd.Series) -> pd.Series:
+        """Parse a column to datetimes, recognizing ISO calendar weeks (YYYYWW) as well as normal dates."""
+        cw = cls._parse_calendar_week(s)
+        if len(s) and cw.notna().sum() / len(s) >= 0.7:
+            return cw
+        return pd.to_datetime(s, errors="coerce")
+
     @staticmethod
     def is_numeric(s: pd.Series) -> bool:
         try:
@@ -38,6 +65,11 @@ class ColumnClassifier:
         out = []
         for c in df.columns:
             if pd.api.types.is_numeric_dtype(df[c]):
+                # plain to_datetime on numbers misreads them as epoch timestamps,
+                # so only the strict calendar-week pattern is accepted here
+                cw = cls._parse_calendar_week(df[c])
+                if len(df) and cw.notna().sum() / len(df) >= 0.7:
+                    out.append(c)
                 continue
             try:
                 parsed = pd.to_datetime(df[c], errors="coerce")

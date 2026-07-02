@@ -206,10 +206,29 @@ class App:
         cc       = ColumnClassifier
         num_cols = cc.numeric_cols(df)
         date_cls = cc.date_cols(df)
+        cat_cols = cc.categorical_cols(df)
 
         if not num_cols:
             st.warning("Keine numerischen Spalten für Prognose.")
             return
+
+        df_forecast = df
+        group_cols  = []
+        batch_mode  = False
+        if cat_cols:
+            group_cols = st.multiselect(
+                "Gruppieren nach (optional)", cat_cols, key="prog_group_cols",
+                help="Z.B. Materialnummer und Werk, um nur eine bestimmte Kombination oder alle auf einmal "
+                     "zu prognostizieren, statt alle Zeilen vermischt in einer Zeitreihe.",
+            )
+            if group_cols:
+                batch_mode = st.checkbox(
+                    "Alle Kombinationen auf einmal prognostizieren", key="prog_batch_mode",
+                    help="Berechnet für jede Kombination eine eigene Prognose, statt nur für eine ausgewählte.",
+                )
+                if not batch_mode:
+                    df_forecast = self._select_forecast_group(df, group_cols)
+                    st.caption(f"{len(df_forecast)} von {len(df)} Zeilen für diese Kombination.")
 
         pr1, pr2 = st.columns(2)
         with pr1:
@@ -270,27 +289,36 @@ class App:
                              help="additive: Saisonschwankungen bleiben über die Zeit gleich groß.\n\n"
                                   "multiplicative: Saisonschwankungen wachsen mit dem Niveau der Werte.")
 
-        y = self._prepare_series(df, value_col, time_col)
-        dropped = len(df) - len(y)
+        if batch_mode:
+            self._section_forecast_batch(df, group_cols, value_col, time_col, method, horizon)
+            return
+
+        y = self._prepare_series(df_forecast, value_col, time_col)
+        dropped = len(df_forecast) - len(y)
         if dropped > 0:
             st.caption(
-                f"{dropped} von {len(df)} Zeilen enthielten ungültige oder fehlende Werte "
+                f"{dropped} von {len(df_forecast)} Zeilen enthielten ungültige oder fehlende Werte "
                 "in Datums-/Wertespalte und wurden für die Prognose ausgeschlossen."
             )
         if len(y) < 3:
             st.warning("Mindestens 3 Datenpunkte nötig.")
             return
 
-        if not st.button("Prognose berechnen"):
+        if st.button("Prognose berechnen"):
+            try:
+                st.session_state["forecast_result"] = self._run_forecast(Forecaster(y), method, horizon)
+                st.session_state["forecast_value_col"] = value_col
+            except Exception as e:
+                st.session_state.pop("forecast_result", None)
+                st.error(self._forecast_error_message(method))
+                with st.expander("Technische Details"):
+                    st.code(str(e))
+
+        if "forecast_result" not in st.session_state:
             return
 
-        try:
-            result = self._run_forecast(Forecaster(y), method, horizon)
-        except Exception as e:
-            st.error(self._forecast_error_message(method))
-            with st.expander("Technische Details"):
-                st.code(str(e))
-            return
+        result    = st.session_state["forecast_result"]
+        value_col = st.session_state["forecast_value_col"]
 
         fig = ChartRenderer.forecast(result, value_col)
         st.pyplot(fig, use_container_width=True)
@@ -316,6 +344,85 @@ class App:
             )
         st.dataframe(prog_df, use_container_width=True, height=240)
         self._export_buttons(prog_df, "prognose.csv", "prognose.xlsx", "Prognose", index=False)
+
+    def _section_forecast_batch(self, df: pd.DataFrame, group_cols: list, value_col: str,
+                                 time_col, method: str, horizon: int):
+        combos = df[group_cols].drop_duplicates().sort_values(group_cols).reset_index(drop=True)
+        st.info(f"{len(combos)} Kombinationen gefunden.")
+        if len(combos) > 50:
+            st.caption(
+                "Bei vielen Kombinationen und ARIMA/Holt-Winters kann die Berechnung etwas dauern."
+            )
+
+        if st.button("Prognose für alle Kombinationen berechnen"):
+            results, errors, skipped = {}, [], []
+            rows = []
+            progress = st.progress(0.0)
+            for i, combo in enumerate(combos.itertuples(index=False)):
+                label = " | ".join(str(v) for v in combo)
+                mask = pd.Series(True, index=df.index)
+                for col, val in zip(group_cols, combo):
+                    mask &= df[col] == val
+                subset = df[mask]
+
+                y = self._prepare_series(subset, value_col, time_col)
+                if len(y) < 3:
+                    skipped.append(label)
+                else:
+                    try:
+                        result = self._run_forecast(Forecaster(y), method, horizon)
+                    except Exception as e:
+                        errors.append((label, str(e)))
+                    else:
+                        results[label] = result
+                        prog_df = result.to_dataframe()
+                        for col, val in zip(reversed(group_cols), reversed(combo)):
+                            prog_df.insert(0, col, val)
+                        rows.append(prog_df)
+                progress.progress((i + 1) / len(combos))
+            progress.empty()
+
+            st.session_state["forecast_batch"] = {
+                "results":   results,
+                "errors":    errors,
+                "skipped":   skipped,
+                "combined":  pd.concat(rows, ignore_index=True) if rows else None,
+                "value_col": value_col,
+                "method":    method,
+                "total":     len(combos),
+            }
+
+        batch = st.session_state.get("forecast_batch")
+        if not batch:
+            return
+
+        st.success(
+            f"{len(batch['results'])} von {batch['total']} Kombinationen erfolgreich prognostiziert "
+            f"({len(batch['skipped'])} übersprungen wegen zu weniger Daten, {len(batch['errors'])} fehlgeschlagen)."
+        )
+        if batch["skipped"]:
+            with st.expander(f"Übersprungen wegen zu weniger Daten ({len(batch['skipped'])})"):
+                st.write(", ".join(batch["skipped"]))
+        if batch["errors"]:
+            with st.expander(f"Fehlgeschlagen ({len(batch['errors'])})"):
+                st.caption(self._forecast_error_message(batch["method"]))
+                for label, msg in batch["errors"]:
+                    st.write(f"**{label}**")
+                    st.code(msg)
+
+        if batch["combined"] is None:
+            return
+
+        st.markdown("#### Kombinierte Prognosetabelle")
+        st.dataframe(batch["combined"], use_container_width=True, height=320)
+        self._export_buttons(batch["combined"], "prognose_batch.csv", "prognose_batch.xlsx",
+                             "Prognose_Batch", index=False)
+
+        st.markdown("#### Einzelne Kombination ansehen")
+        chosen = st.selectbox("Kombination", list(batch["results"].keys()), key="prog_batch_view")
+        fig = ChartRenderer.forecast(batch["results"][chosen], batch["value_col"])
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
 
     # ── private helpers ───────────────────────────────────────────────────────
 
@@ -368,6 +475,22 @@ class App:
         return forecaster.exp_smoothing(st.session_state.get("prog_alpha", 0.3), horizon)
 
     @staticmethod
+    def _select_forecast_group(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+        """Let the user pick one specific combination of group_cols; returns the matching rows."""
+        combos = df[group_cols].drop_duplicates().sort_values(group_cols).reset_index(drop=True)
+        labels = [" | ".join(str(v) for v in row) for row in combos.itertuples(index=False)]
+
+        # key depends on group_cols so switching the grouping columns doesn't reuse a stale selection
+        key    = "prog_group_combo_" + "_".join(group_cols)
+        choice = st.selectbox("Kombination auswählen", labels, key=key)
+        selected = combos.iloc[labels.index(choice)]
+
+        mask = pd.Series(True, index=df.index)
+        for col in group_cols:
+            mask &= df[col] == selected[col]
+        return df[mask]
+
+    @staticmethod
     def _prepare_series(df: pd.DataFrame, value_col: str, time_col) -> np.ndarray:
         if time_col:
             ts = df[[time_col, value_col]].copy()
@@ -379,9 +502,12 @@ class App:
             if isinstance(v_series, pd.DataFrame):
                 v_series = v_series.iloc[:, 0]
             ts = pd.DataFrame({time_col: t_series.values, value_col: v_series.values})
-            ts[time_col]  = pd.to_datetime(ts[time_col], errors="coerce")
+            ts[time_col]  = ColumnClassifier.parse_dates(ts[time_col])
             ts[value_col] = pd.to_numeric(ts[value_col], errors="coerce")
             ts = ts.dropna().sort_values(time_col).reset_index(drop=True)
+            if ts[time_col].duplicated().any():
+                # multiple rows for the same period (e.g. several deliveries in one week) — sum them
+                ts = ts.groupby(time_col, as_index=False)[value_col].sum().sort_values(time_col).reset_index(drop=True)
         else:
             ts = df[[value_col]].apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
         return ts[value_col].to_numpy(dtype=float)
