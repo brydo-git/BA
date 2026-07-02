@@ -1,0 +1,20 @@
+# Virtuelle Umgebung
+.venv/
+venv/
+
+# Python Bytecode/Cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+#Tests
+tests/
+
+# Streamlit-Geheimnisse (falls später verwendet)
+.streamlit/secrets.toml
+
+# Editor
+.vscode/
+
+# Betriebssystem
+.DS_Store
