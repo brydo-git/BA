@@ -127,10 +127,12 @@ class App:
         st.markdown("#### Balkendiagramme")
         for _, fig in analyzer.bar_charts(stats_df):
             st.pyplot(fig, use_container_width=False)
+            plt.close(fig)
 
         st.markdown("#### Boxplots")
         for _, fig in analyzer.boxplots():
             st.pyplot(fig, use_container_width=False)
+            plt.close(fig)
 
         self._export_buttons(stats_df, "statistik.csv", "statistik.xlsx", "Statistik")
 
@@ -324,16 +326,30 @@ class App:
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
+        metrics = []
+        if result.rmse is not None:
+            metrics.append(f"RMSE: **{result.rmse:.2f}**")
+        if result.mae is not None:
+            metrics.append(f"MAE: **{result.mae:.2f}**")
         if result.r2 is not None:
-            st.info(
-                f"Steigung: **{result.slope:+.4f}** pro Periode · "
-                f"R²: **{result.r2:.3f}** · RMSE: **{result.rmse:.2f}**"
-            )
+            metrics.append(f"R²: **{result.r2:.3f}**")
+        if result.slope is not None:
+            metrics.append(f"Steigung: **{result.slope:+.4f}** pro Periode")
+
+        if metrics:
+            st.info(" · ".join(metrics))
             st.caption(
-                "R² (Bestimmtheitsmaß): wie gut die Gerade zu den historischen Daten passt "
-                "(1,0 = perfekte Anpassung, 0 = kein Zusammenhang). "
-                "RMSE: durchschnittlicher Vorhersagefehler in der Einheit der Werte – je kleiner, desto genauer."
+                "RMSE und MAE messen, wie gut das Modell zu den **historischen** Daten passt "
+                "(In-Sample-Fit), jeweils in der Einheit der Werte – je kleiner, desto besser. "
+                "RMSE bestraft große Ausreißer stärker, MAE ist der durchschnittliche absolute Fehler. "
+                "Hinweis: Diese Werte messen die Anpassung an die Vergangenheit, nicht die echte "
+                "Prognosegüte, und sind zwischen den Methoden nur eingeschränkt vergleichbar."
             )
+            if result.r2 is not None:
+                st.caption(
+                    "R² (Bestimmtheitsmaß): wie gut die Gerade zu den historischen Daten passt "
+                    "(1,0 = perfekte Anpassung, 0 = kein Zusammenhang)."
+                )
 
         prog_df = result.to_dataframe()
         st.markdown("#### Prognosetabelle")
