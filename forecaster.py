@@ -49,6 +49,21 @@ class Forecaster:
         mae   = float(np.mean(np.abs(resid)))
         return rmse, mae
 
+    def naive(self, steps: int) -> ForecastResult:
+        # Baseline: der letzte beobachtete Wert wird konstant fortgeschrieben.
+        # In-Sample-Fit = Ein-Schritt-Prognose (jeder Punkt wird durch seinen Vorgänger geschätzt).
+        fitted    = np.empty(self._n)
+        fitted[0] = self._y[0]
+        fitted[1:] = self._y[:-1]
+        rmse, mae = self._fit_errors(self._y, fitted)
+        x_fut  = np.arange(self._n, self._n + steps, dtype=float)
+        return ForecastResult(
+            method="Naive Prognose",
+            y_hist=self._y, x_num=self._x,
+            x_fut=x_fut, y_fut=np.full(steps, self._y[-1]), y_fitted=fitted,
+            rmse=rmse, mae=mae,
+        )
+
     def linear(self, steps: int) -> ForecastResult:
         slope, intercept, r, *_ = scipy_stats.linregress(self._x, self._y)
         fitted    = slope * self._x + intercept
