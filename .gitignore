@@ -8,7 +8,7 @@ __pycache__/
 .pytest_cache/
 
 #Tests
-tests/
+#tests/
 
 # Streamlit-Geheimnisse (falls später verwendet)
 .streamlit/secrets.toml

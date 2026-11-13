@@ -12,6 +12,10 @@ from exporter import Exporter
 
 
 class App:
+    # Zeitraster der Prognose: Anzeigename -> interner Code (None = Zeitpunkte unverändert)
+    FREQ_LABELS = {"Automatisch": None, "Tag": "D", "Woche": "W", "Monat": "M"}
+    # pandas-Frequenz des Rasters, jeweils auf den Periodenbeginn (Woche ab Montag)
+    _GRID_FREQ  = {"D": "D", "W": "W-MON", "M": "MS"}
     def __init__(self):
         st.set_page_config(page_title="Statistik- und Prognose Tool", layout="wide")
         self._apply_compact_ui()
@@ -243,6 +247,16 @@ class App:
                     date_cls + [c for c in df.columns if c not in date_cls],
                     key="prog_tcol",
                 )
+                freq_label = st.selectbox(
+                    "Zeitraster",
+                    list(self.FREQ_LABELS),
+                    key="prog_freq",
+                    help="Fasst die Werte pro Zeitraum zusammen (Summe), z. B. alle Buchungen einer Woche.\n\n"
+                         "**Automatisch**: Zeitpunkte so verwenden, wie sie in den Daten stehen.\n\n"
+                         "**Tag / Woche / Monat**: Werte je Tag, Kalenderwoche (ab Montag) oder Monat "
+                         "summieren. Zeiträume ohne Buchung werden zuverlässig ergänzt – über den "
+                         "gesamten Zeitraum der Datei.",
+                )
                 fill_label = st.selectbox(
                     "Fehlende Perioden auffüllen",
                     ["Mit 0 auffüllen", "Interpolieren", "Nicht auffüllen"],
@@ -256,6 +270,7 @@ class App:
                 )
             else:
                 time_col = None
+                freq_label = "Automatisch"
                 fill_label = "Nicht auffüllen"
                 st.caption("Zeitachse = Zeilenindex (1, 2, 3 …)")
             # Datumsspalte nicht als Wertespalte anbieten (sonst Datum == Y)
@@ -266,6 +281,10 @@ class App:
             value_col = st.selectbox("Wertespalte (Y)", value_choices, key="prog_vcol")
 
         fill_mode = {"Mit 0 auffüllen": "zero", "Interpolieren": "interpolate"}.get(fill_label, "none")
+        freq      = self.FREQ_LABELS[freq_label]
+        # Gesamtzeitraum der Datei (nicht nur der gewählten Kombination), damit z. B. Wochen
+        # ohne Buchung am Anfang/Ende einer Materialreihe ebenfalls als 0 erscheinen
+        period_range = self._date_range(df, time_col) if freq else None
 
         with pr2:
             st.markdown("**Methode & Horizont**")
@@ -314,11 +333,12 @@ class App:
                                   "multiplicative: Saisonschwankungen wachsen mit dem Niveau der Werte.")
 
         if batch_mode:
-            self._section_forecast_batch(df, group_cols, value_col, time_col, method, horizon, fill_mode)
+            self._section_forecast_batch(df, group_cols, value_col, time_col, method, horizon,
+                                         fill_mode, freq, period_range)
             return
 
         y, n_invalid, n_merged, n_inserted = self._prepare_series(
-            df_forecast, value_col, time_col, fill_mode
+            df_forecast, value_col, time_col, fill_mode, freq, period_range
         )
         notes = []
         if n_invalid > 0:
@@ -334,6 +354,12 @@ class App:
         if notes:
             st.caption(
                 " · ".join(notes) + f" — {len(y)} Datenpunkte für die Prognose."
+            )
+        partial = self._partial_periods(period_range, freq)
+        if partial:
+            st.caption(
+                f"Hinweis: Die Datei beginnt bzw. endet mitten in einer Periode ({', '.join(partial)}). "
+                "Diese Periode enthält nicht alle Tage und fällt daher eher zu niedrig aus."
             )
         if len(y) < 3:
             st.warning("Mindestens 3 Datenpunkte nötig.")
@@ -441,7 +467,8 @@ class App:
         self._export_buttons(prog_df, "prognose.csv", "prognose.xlsx", "Prognose", index=False)
 
     def _section_forecast_batch(self, df: pd.DataFrame, group_cols: list, value_col: str,
-                                 time_col, method: str, horizon: int, fill_mode: str = "none"):
+                                 time_col, method: str, horizon: int, fill_mode: str = "none",
+                                 freq=None, period_range=None):
         combos = df[group_cols].drop_duplicates().sort_values(group_cols).reset_index(drop=True)
         st.info(f"{len(combos)} Kombinationen gefunden.")
         if len(combos) > 50:
@@ -460,7 +487,8 @@ class App:
                     mask &= df[col] == val
                 subset = df[mask]
 
-                y, _, _, _ = self._prepare_series(subset, value_col, time_col, fill_mode)
+                y, _, _, _ = self._prepare_series(subset, value_col, time_col, fill_mode,
+                                                  freq, period_range)
                 if len(y) < 3:
                     skipped.append(label)
                 else:
@@ -652,8 +680,80 @@ class App:
         return ts, n_inserted
 
     @staticmethod
-    def _prepare_series(df: pd.DataFrame, value_col: str, time_col, fill_mode: str = "none"):
+    def _period_start(dates: pd.Series, freq: str) -> pd.Series:
+        """Ordnet jedes Datum dem Beginn seiner Periode zu (Tag, Montag der KW, Monatserster)."""
+        if freq == "D":
+            return dates.dt.normalize()
+        if freq == "W":
+            return dates.dt.to_period("W-SUN").dt.start_time
+        return dates.dt.to_period("M").dt.start_time
+
+    @staticmethod
+    def _date_range(df: pd.DataFrame, time_col):
+        """(erstes, letztes) gültiges Datum der gesamten Datei in time_col, sonst None."""
+        if not time_col:
+            return None
+        col = df[time_col]
+        if isinstance(col, pd.DataFrame):
+            col = col.iloc[:, 0]
+        dates = ColumnClassifier.parse_dates(col).dropna()
+        if dates.empty:
+            return None
+        return dates.min(), dates.max()
+
+    @staticmethod
+    def _partial_periods(period_range, freq) -> list:
+        """Liste der Ränder ('erste'/'letzte Periode'), an denen die Datei mitten in einer
+        Woche/einem Monat beginnt oder endet."""
+        if not period_range or freq not in ("W", "M"):
+            return []
+        start, end = (pd.Timestamp(d).normalize() for d in period_range)
+        first_start = App._period_start(pd.Series([start]), freq).iloc[0]
+        last_start  = App._period_start(pd.Series([end]), freq).iloc[0]
+        last_end    = last_start + pd.tseries.frequencies.to_offset(App._GRID_FREQ[freq]) - pd.Timedelta(days=1)
+        out = []
+        if start != first_start:
+            out.append("erste Periode")
+        if end != last_end:
+            out.append("letzte Periode")
+        return out
+
+    @staticmethod
+    def _fill_to_grid(ts: pd.DataFrame, time_col: str, value_col: str, mode: str,
+                      freq: str, period_range=None):
+        """Ergänzt alle Perioden des gewählten Rasters (Tag/Woche/Monat) ohne Wert.
+
+        Anders als _fill_missing_periods ohne Regelmäßigkeitsprüfung: bei festem Raster ist jede
+        leere Periode eine echte Lücke – auch bei sporadischen Daten (z. B. an 24 von 61 Tagen
+        gebucht). Bei 'zero' wird zusätzlich bis an den Anfang/das Ende von period_range
+        (Zeitraum der ganzen Datei) aufgefüllt; Interpolation bleibt im Datenbereich.
+        Rückgabe: (ts, n_inserted).
+        """
+        if mode not in ("zero", "interpolate") or ts.empty:
+            return ts, 0
+        start, end = ts[time_col].min(), ts[time_col].max()
+        if mode == "zero" and period_range:
+            bounds = App._period_start(pd.Series(list(period_range)), freq)
+            start, end = min(start, bounds.iloc[0]), max(end, bounds.iloc[1])
+        full = pd.date_range(start, end, freq=App._GRID_FREQ[freq])
+        n_inserted = len(full) - len(ts)
+        if n_inserted <= 0:
+            return ts, 0
+        ts = ts.set_index(time_col).reindex(full)
+        if mode == "zero":
+            ts[value_col] = ts[value_col].fillna(0.0)
+        else:
+            ts[value_col] = ts[value_col].interpolate(method="linear")
+        ts = ts.rename_axis(time_col).reset_index()
+        return ts, n_inserted
+
+    @staticmethod
+    def _prepare_series(df: pd.DataFrame, value_col: str, time_col, fill_mode: str = "none",
+                        freq=None, period_range=None):
         """Bereitet die Zeitreihe auf.
+
+        freq: None (Zeitpunkte unverändert) oder 'D'/'W'/'M' – Werte je Tag/Woche/Monat summieren.
+        period_range: (start, ende) der ganzen Datei; nur mit freq relevant (Auffüllen bis an die Ränder).
 
         Rückgabe: (y, n_invalid, n_merged, n_inserted)
           n_invalid  = Zeilen mit ungültigem/fehlendem Datum oder Wert (ausgeschlossen)
@@ -676,11 +776,18 @@ class App:
             ts[value_col] = pd.to_numeric(ts[value_col], errors="coerce")
             ts = ts.dropna().sort_values(time_col).reset_index(drop=True)
             n_valid = len(ts)  # nach Ausschluss ungültiger Zeilen, vor dem Zusammenfassen
+            if freq and not pd.api.types.is_datetime64_any_dtype(ts[time_col]):
+                freq = None  # ohne echte Datumsachse kein Raster möglich (z. B. Datum == Wertespalte)
+            if freq:
+                ts[time_col] = App._period_start(ts[time_col], freq)
             if ts[time_col].duplicated().any():
                 # multiple rows for the same period (e.g. several deliveries in one week) — sum them
                 ts = ts.groupby(time_col, as_index=False)[value_col].sum().sort_values(time_col).reset_index(drop=True)
             n_merged = n_valid - len(ts)
-            ts, n_inserted = App._fill_missing_periods(ts, time_col, value_col, fill_mode)
+            if freq:
+                ts, n_inserted = App._fill_to_grid(ts, time_col, value_col, fill_mode, freq, period_range)
+            else:
+                ts, n_inserted = App._fill_missing_periods(ts, time_col, value_col, fill_mode)
         else:
             ts = df[[value_col]].apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
             n_valid  = len(ts)

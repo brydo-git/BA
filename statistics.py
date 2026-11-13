@@ -54,12 +54,15 @@ class StatisticsAnalyzer:
     # ── Gruppenstatistik ──────────────────────────────────────────────────────
 
     AGG_MAP = {
-        "Summe":      "sum",
-        "Mittelwert": "mean",
-        "Median":     "median",
-        "Anzahl":     "count",
-        "Minimum":    "min",
-        "Maximum":    "max",
+        "Summe":              "sum",
+        "Mittelwert":         "mean",
+        "Median":             "median",
+        "Anzahl":             "count",
+        "Minimum":            "min",
+        "Maximum":            "max",
+        "Standardabweichung": "std",
+        "25%-Quantil":        lambda s: s.quantile(0.25),
+        "75%-Quantil":        lambda s: s.quantile(0.75),
     }
     AGG_NAMES = list(AGG_MAP.keys())
 
